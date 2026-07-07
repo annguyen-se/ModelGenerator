@@ -1,5 +1,7 @@
 #!/usr/bin/env node
 
+'use strict';
+
 const fs = require('fs');
 const path = require('path');
 
@@ -40,11 +42,6 @@ function pluralize(word) {
 
 /* -------------------- Heuristic phát hiện ObjectId ref ------------------- */
 
-/**
- * Các field thường là self-reference (quản lý cấp trên, cha-con...).
- * Khi gặp field này mà value là String (tên người) hoặc null
- * -> vẫn gen ObjectId self-ref thay vì String.
- */
 const SELF_REF_KEYS = new Set([
   'manager',
   'supervisor',
@@ -56,46 +53,26 @@ const SELF_REF_KEYS = new Set([
   'parentNode',
 ]);
 
-/**
- * Kiểm tra xem tên field có phải là foreign key không.
- * Ví dụ: userId, departmentId, managerId, user_id, department_id
- */
 function looksLikeForeignKey(key) {
   return /(_id|Id)$/.test(key) && key !== '_id';
 }
 
-/**
- * Trích xuất tên entity từ tên field FK.
- * userId -> User, department_id -> Department, managerId -> Manager
- */
 function extractRefFromKey(key) {
   const cleaned = key.replace(/(_id|Id)$/, '');
   return toPascalCase(cleaned);
 }
 
-/**
- * Kiểm tra xem 1 string có thể là ObjectId 24 hex char không.
- * Ví dụ: "6706c540be090ec1c08abf8a"
- */
 function looksLikeObjectId(value) {
   return typeof value === 'string' && /^[a-f\d]{24}$/i.test(value);
 }
 
 /* ------------------------------ Suy luận kiểu ------------------------------ */
 
-/**
- * Suy luận kiểu Mongoose từ một giá trị JSON.
- * Trả về string (tên kiểu) hoặc object (nested schema).
- * Thêm context để ghi comment TODO khi cần review thủ công.
- */
 function inferType(value, key = '', context = {}) {
-  // --- null / undefined ---
   if (value === null || value === undefined) {
-    // Self-ref: manager, supervisor... -> ObjectId ref về chính entity hiện tại
     if (SELF_REF_KEYS.has(key)) {
       return `{ type: mongoose.Schema.Types.ObjectId, ref: '__SELF__' } /* TODO: thay __SELF__ bằng tên Model hiện tại */`;
     }
-    // Nếu key trông như FK -> gợi ý ObjectId thay vì Mixed
     if (looksLikeForeignKey(key)) {
       const ref = extractRefFromKey(key);
       return `{ type: mongoose.Schema.Types.ObjectId, ref: '${ref}' } /* TODO: xác nhận ref */`;
@@ -103,14 +80,12 @@ function inferType(value, key = '', context = {}) {
     return 'mongoose.Schema.Types.Mixed /* TODO: null trong mẫu - xác nhận kiểu thực */';
   }
 
-  // --- MongoDB Extended JSON: { $oid }, { $date }, { $numberDecimal } ---
   if (typeof value === 'object' && !Array.isArray(value)) {
     if ('$oid' in value) {
       if (looksLikeForeignKey(key)) {
         const ref = extractRefFromKey(key);
         return `{ type: mongoose.Schema.Types.ObjectId, ref: '${ref}' }`;
       }
-      // Fallback: dùng tên key để đoán entity (giữ cũ nhưng cải thiện message)
       return `{ type: mongoose.Schema.Types.ObjectId, ref: '__TODO__' } /* TODO: điền tên Model */`;
     }
     if ('$date' in value) return 'Date';
@@ -122,7 +97,6 @@ function inferType(value, key = '', context = {}) {
   switch (type) {
     case 'string':
       if (isISODateString(value)) return 'Date';
-      // Phát hiện string trông như ObjectId hex -> gợi ý ref
       if (looksLikeObjectId(value)) {
         if (looksLikeForeignKey(key)) {
           const ref = extractRefFromKey(key);
@@ -130,7 +104,6 @@ function inferType(value, key = '', context = {}) {
         }
         return `{ type: mongoose.Schema.Types.ObjectId, ref: '__TODO__' } /* TODO: có thể là ObjectId - xác nhận */`;
       }
-      // Self-ref dạng string tên người ("Emily Johnson") -> vẫn nên là ObjectId
       if (SELF_REF_KEYS.has(key)) {
         return `{ type: mongoose.Schema.Types.ObjectId, ref: '__SELF__' } /* TODO: thay __SELF__ bằng tên Model hiện tại - data mẫu đang lưu string tên thay vì ObjectId */`;
       }
@@ -145,14 +118,12 @@ function inferType(value, key = '', context = {}) {
     case 'object':
       if (Array.isArray(value)) {
         if (value.length === 0) {
-          // Mảng rỗng: thử đoán từ tên key
           if (looksLikeForeignKey(key) || key.toLowerCase().endsWith('ids')) {
             return `[{ type: mongoose.Schema.Types.ObjectId, ref: '__TODO__' }] /* TODO: mảng ref - điền tên Model */`;
           }
           return `[mongoose.Schema.Types.Mixed] /* TODO: mảng rỗng trong mẫu - xác nhận kiểu phần tử */`;
         }
         const first = value[0];
-        // Mảng ObjectId: [{ $oid: '...' }]
         if (typeof first === 'object' && first !== null && '$oid' in first) {
           const ref = looksLikeForeignKey(key) ? extractRefFromKey(key) : '__TODO__';
           const todo = ref === '__TODO__' ? ' /* TODO: điền tên Model */' : '';
@@ -165,7 +136,6 @@ function inferType(value, key = '', context = {}) {
         return `[${innerType}]`;
       }
 
-      // Nested object -> nested schema
       const nestedSchema = {};
       for (const k in value) {
         if (k === '_id') continue;
@@ -178,9 +148,6 @@ function inferType(value, key = '', context = {}) {
   }
 }
 
-/**
- * Chuyển object định nghĩa kiểu thành chuỗi code (đệ quy).
- */
 function stringifySchema(obj, indent = '  ') {
   let str = '{\n';
   for (const [key, value] of Object.entries(obj)) {
@@ -194,61 +161,40 @@ function stringifySchema(obj, indent = '  ') {
   return str;
 }
 
-/* ------------------- Phân tích thêm từ nhiều mẫu (mới) ------------------- */
+/* ------------------- Phân tích thêm từ nhiều mẫu ------------------- */
 
-/**
- * Chọn giá trị "thông tin nhất" trong mảng mẫu cho 1 field.
- * Ưu tiên: có dữ liệu thật > null > mảng rỗng > undefined
- */
 function pickRepresentativeValue(samples, key) {
   const values = samples.map((s) => s[key]).filter((v) => v !== undefined);
   if (values.length === 0) return undefined;
-
-  // Ưu tiên giá trị không null và mảng có phần tử
   const best = values.find((v) => v !== null && !(Array.isArray(v) && v.length === 0));
   return best !== undefined ? best : values[0];
 }
 
-/**
- * Phân tích enum: nếu field có ít giá trị unique và toàn string
- * -> gợi ý enum trong comment.
- */
 function detectEnum(samples, key) {
-  // Bỏ qua các field chắc chắn không phải enum
   const skipPatterns = [
     /name|email|password|url|description|title|address|phone|token|slug|message|comment|manager|owner|author|creator/i,
   ];
   if (skipPatterns.some((p) => p.test(key))) return null;
-  // Cũng bỏ qua nếu key trông như ref (có thể là string name của entity khác)
   if (looksLikeForeignKey(key)) return null;
   const values = samples.map((s) => s[key]).filter((v) => v !== null && v !== undefined && typeof v === 'string');
-
   if (values.length < 2) return null;
-
   const unique = [...new Set(values)];
-  // Chỉ gợi ý enum nếu số giá trị unique <= nửa số mẫu (và tối đa 10)
   if (unique.length >= 2 && unique.length <= Math.min(10, Math.ceil(samples.length / 2))) {
     return unique;
   }
   return null;
 }
 
-/**
- * Kiểm tra tất cả giá trị của field có đều khác nhau không (candidate unique).
- * Bỏ qua field nested object/array. Chỉ áp dụng cho String/Number.
- * Cần ít nhất 3 mẫu để tránh false positive.
- */
 function detectUnique(samples, key) {
   if (samples.length < 3) return false;
   const values = samples
     .map((s) => s[key])
     .filter((v) => v !== null && v !== undefined && (typeof v === 'string' || typeof v === 'number'));
-  if (values.length < samples.length) return false; // có null -> không unique
+  if (values.length < samples.length) return false;
   const unique = new Set(values);
   return unique.size === values.length;
 }
 
-/** Sinh object định nghĩa schema từ nhiều document mẫu. */
 function buildSchemaDefinition(samples) {
   const keys = new Set();
   samples.forEach((s) => Object.keys(s || {}).forEach((k) => keys.add(k)));
@@ -259,15 +205,12 @@ function buildSchemaDefinition(samples) {
 
     const representative = pickRepresentativeValue(samples, key);
     let typeDef = inferType(representative, key);
-
     const isUnique = detectUnique(samples, key);
 
-    // Gợi ý enum nếu field là String và có ít giá trị unique
     if (typeDef === 'String') {
       const enumValues = detectEnum(samples, key);
       if (enumValues) {
         const enumStr = enumValues.map((v) => `'${v}'`).join(', ');
-        // Cảnh báo rõ: enum chỉ từ data mẫu, có thể thiếu values
         const enumNote = 'TODO: enum chỉ từ data mẫu - kiểm tra có thiếu value nào không';
         typeDef = `{ type: String, enum: [${enumStr}] } /* ${enumNote} */`;
       } else if (isUnique) {
@@ -280,30 +223,13 @@ function buildSchemaDefinition(samples) {
   return schemaDefinition;
 }
 
-/* ------------------------------ Sinh nội dung ------------------------------ */
+/* ------------------------------ Templates output ------------------------------ */
 
 /**
- * Đếm số lượng TODO còn trong schema để hiển thị cảnh báo.
+ * Template CJS: dùng require / module.exports
  */
-function countTodos(content) {
-  return (content.match(/TODO/g) || []).length;
-}
-
-/**
- * Sinh nội dung file Mongoose Model từ 1 hoặc nhiều document mẫu.
- */
-function generateModelFile(jsonData, entityName) {
-  const samples = Array.isArray(jsonData) ? jsonData : [jsonData];
-  const schemaDefinition = buildSchemaDefinition(samples);
-  const schemaContent = stringifySchema(schemaDefinition);
-
-  const pascalName = toPascalCase(entityName);
-  const camelName = pascalName[0].toLowerCase() + pascalName.slice(1);
-  // Giữ PascalCase cho collection name (theo convention MongoDB/Mongoose phổ biến)
-  const collectionName = pluralize(pascalName);
-  const schemaVarName = `${camelName}Schema`;
-
-  const content = `const mongoose = require('mongoose');
+function renderCJS(pascalName, schemaVarName, schemaContent, collectionName) {
+  return `const mongoose = require('mongoose');
 
 const ${schemaVarName} = new mongoose.Schema(
 ${schemaContent},
@@ -312,13 +238,52 @@ ${schemaContent},
 
 module.exports = mongoose.model('${pascalName}', ${schemaVarName}, '${collectionName}');
 `;
+}
+
+/**
+ * Template ESM: dùng import / export default
+ */
+function renderESM(pascalName, schemaVarName, schemaContent, collectionName) {
+  return `import mongoose from 'mongoose';
+
+const ${schemaVarName} = new mongoose.Schema(
+${schemaContent},
+  { timestamps: true }
+);
+
+export default mongoose.model('${pascalName}', ${schemaVarName}, '${collectionName}');
+`;
+}
+
+/* ------------------------------ Sinh nội dung ------------------------------ */
+
+function countTodos(content) {
+  return (content.match(/TODO/g) || []).length;
+}
+
+/**
+ * @param {object|object[]} jsonData  - dữ liệu mẫu
+ * @param {string}          entityName
+ * @param {'cjs'|'esm'}     mode      - output format
+ */
+function generateModelFile(jsonData, entityName, mode = 'cjs') {
+  const samples = Array.isArray(jsonData) ? jsonData : [jsonData];
+  const schemaDefinition = buildSchemaDefinition(samples);
+  const schemaContent = stringifySchema(schemaDefinition);
+
+  const pascalName = toPascalCase(entityName);
+  const camelName = pascalName[0].toLowerCase() + pascalName.slice(1);
+  const collectionName = pluralize(pascalName);
+  const schemaVarName = `${camelName}Schema`;
+
+  const content =
+    mode === 'esm'
+      ? renderESM(pascalName, schemaVarName, schemaContent, collectionName)
+      : renderCJS(pascalName, schemaVarName, schemaContent, collectionName);
 
   const todoCount = countTodos(content);
   if (todoCount > 0) {
-    return {
-      content,
-      warnings: [`${todoCount} TODO cần review thủ công trong schema.`],
-    };
+    return { content, warnings: [`${todoCount} TODO cần review thủ công trong schema.`] };
   }
   return { content, warnings: [] };
 }
@@ -350,35 +315,74 @@ function writeModelFile(outputDir, entityName, content) {
   return filePath;
 }
 
-function processEntity(name, data, outputDir) {
+function processEntity(name, data, outputDir, mode) {
   const samples = Array.isArray(data) ? data : [data];
   if (samples.length === 0 || !samples[0]) {
-    console.warn(`⚠️  Bỏ qua "${name}": không có dữ liệu mẫu hợp lệ.`);
+    console.warn(`Bỏ qua "${name}": không có dữ liệu mẫu hợp lệ.`);
     return null;
   }
 
-  const { content, warnings } = generateModelFile(samples, name);
+  const { content, warnings } = generateModelFile(samples, name, mode);
   const filePath = writeModelFile(outputDir, name, content);
 
-  console.log(`✅ Đã tạo: ${filePath}`);
+  console.log(` Đã tạo: ${filePath}`);
   if (warnings.length > 0) {
-    warnings.forEach((w) => console.warn(`   ⚠️  ${w}`));
+    warnings.forEach((w) => console.warn(`   ${w}`));
   }
   return filePath;
 }
 
+/* --------------------------------- CLI --------------------------------- */
+
+function parseArgs(argv) {
+  const args = argv.slice(2); // bỏ 'node' và tên script
+  let mode = 'cjs'; // default
+  let outputDir = null;
+  const positional = [];
+
+  for (let i = 0; i < args.length; i++) {
+    const arg = args[i];
+    if (arg === '--esm') {
+      mode = 'esm';
+    } else if (arg === '--cjs') {
+      mode = 'cjs';
+    } else if (arg === '--output' || arg === '-o') {
+      outputDir = args[++i];
+    } else if (arg.startsWith('--output=')) {
+      outputDir = arg.slice('--output='.length);
+    } else if (!arg.startsWith('-')) {
+      positional.push(arg);
+    }
+  }
+
+  return {
+    inputPath: positional[0] || null,
+    outputDir: outputDir || positional[1] || './models',
+    mode,
+  };
+}
+
 function printUsage() {
   console.log(`Cách dùng:
-  node generate-mongoose-model.js <input.json | input-folder> [outputDir]
+  node generate-mongoose-model.js <input.json | input-folder> [outputDir] [--esm | --cjs]
+
+Flags:
+  --cjs          Output dùng require / module.exports  (mặc định)
+  --esm          Output dùng import / export default
+  --output, -o   Thư mục đầu ra (thay thế cho positional outputDir)
 
 Định dạng input được hỗ trợ:
-  1) File JSON chứa 1 document mẫu          -> tên entity lấy theo tên file
+  1) File JSON chứa 1 document mẫu            -> tên entity lấy theo tên file
   2) File JSON chứa mảng document cùng entity -> hợp nhất nhiều mẫu
   3) File JSON dạng [{ "name": "...", "data": {...} }, ...]
      -> sinh nhiều entity trong 1 lần chạy
   4) Thư mục chứa nhiều file .json, mỗi file là 1 entity
 
-outputDir mặc định: ./models
+Ví dụ:
+  node generate-mongoose-model.js data/user.json
+  node generate-mongoose-model.js data/user.json --esm
+  node generate-mongoose-model.js data/ ./src/models --esm
+  node generate-mongoose-model.js entities.json -o ./models --cjs
 
 Tính năng tự động:
   - Phát hiện ObjectId ref từ tên field (userId, department_id, ...)
@@ -391,17 +395,19 @@ Tính năng tự động:
 }
 
 function main() {
-  const [, , inputPath, outputDirArg] = process.argv;
+  const { inputPath, outputDir, mode } = parseArgs(process.argv);
+
   if (!inputPath) {
     printUsage();
     process.exit(1);
   }
   if (!fs.existsSync(inputPath)) {
-    console.error(`❌ Không tìm thấy: "${inputPath}"`);
+    console.error(` Không tìm thấy: "${inputPath}"`);
     process.exit(1);
   }
 
-  const outputDir = outputDirArg || './models';
+  console.log(` Mode: ${mode.toUpperCase()}\n`);
+
   const stat = fs.statSync(inputPath);
   const generated = [];
   let totalWarnings = 0;
@@ -415,26 +421,26 @@ function main() {
     for (const file of files) {
       const entityName = deriveEntityName(file);
       const json = readJSON(path.join(inputPath, file));
-      const result = processEntity(entityName, json, outputDir);
+      const result = processEntity(entityName, json, outputDir, mode);
       if (result) generated.push(result);
     }
   } else {
     const json = readJSON(inputPath);
     if (isEntityConfigArray(json)) {
       for (const { name, data } of json) {
-        const result = processEntity(name, data, outputDir);
+        const result = processEntity(name, data, outputDir, mode);
         if (result) generated.push(result);
       }
     } else {
       const entityName = deriveEntityName(inputPath);
-      const result = processEntity(entityName, json, outputDir);
+      const result = processEntity(entityName, json, outputDir, mode);
       if (result) generated.push(result);
     }
   }
 
-  console.log(`\nHoàn tất! Đã sinh ${generated.length} model file vào "${outputDir}".`);
+  console.log(`\nHoàn tất! Đã sinh ${generated.length} model file (${mode.toUpperCase()}) vào "${outputDir}".`);
   if (totalWarnings > 0) {
-    console.warn(`⚠️  Hãy tìm kiếm "TODO" trong các file vừa tạo để hoàn thiện schema.`);
+    console.warn(`  Hãy tìm kiếm "TODO" trong các file vừa tạo để hoàn thiện schema.`);
   }
 }
 
