@@ -318,7 +318,7 @@ function generateModelFile(jsonData, entityName, mode = 'cjs', timestamps = fals
 
   const pascalName = toPascalCase(entityName);
   const camelName = pascalName[0].toLowerCase() + pascalName.slice(1);
-  const collectionName = pluralize(pascalName);
+  const collectionName = pluralize(pascalName).toLowerCase();
   const schemaVarName = `${camelName}Schema`;
 
   const content =
