@@ -59,4 +59,4 @@ node generate-mongoose-model.js .\inputs\ .\models\ --esm --timestamps
 
 **Gợi ý schema**: hợp nhất nhiều mẫu để ra schema đầy đủ nhất; gợi ý `enum` từ tập giá trị nhỏ; **chỉ tự gắn `unique: true` khi tên field có khóa duy nhất (`email`, `username`, `code`, `sku`, `slug`, `phoneNumber`, `accountNumber`)**. Với field khác mà data trùng khớp toàn bộ, tool chỉ gắn `/* TODO: unique? */` để tránh ràng buộc sai gây `E11000` khi insert.
 
-**Chuẩn hóa**: tên entity → PascalCase cho `model name`; tên collection → chữ thường (theo quy ước Mongo).
+**Chuẩn hóa**: tên entity → PascalCase cho cả `model name`, `file name` (vd `Users.js`) và `ref`; tên collection → chữ thường (theo quy ước Mongo, do Mongoose tự suy ra từ model name).

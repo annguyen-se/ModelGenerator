@@ -379,7 +379,9 @@ function isEntityConfigArray(json) {
 
 function writeModelFile(outputDir, entityName, content) {
   if (!fs.existsSync(outputDir)) fs.mkdirSync(outputDir, { recursive: true });
-  const fileName = `${entityName.toLowerCase()}.js`;
+  // File name khớp Model name (PascalCase) để import/đối chiếu nhất quán với `mongoose.model(...)`.
+  // Collection name (lowercase, plural) vẫn do Mongoose tự suy ra từ model name.
+  const fileName = `${toPascalCase(entityName)}.js`;
   const filePath = path.join(outputDir, fileName);
   fs.writeFileSync(filePath, content, 'utf-8');
   return filePath;
