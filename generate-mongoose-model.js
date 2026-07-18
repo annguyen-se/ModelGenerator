@@ -225,30 +225,26 @@ function buildSchemaDefinition(samples) {
 
 /* ------------------------------ Templates output ------------------------------ */
 
-/**
- * Template CJS: dùng require / module.exports
- */
-function renderCJS(pascalName, schemaVarName, schemaContent, collectionName) {
+function renderCJS(pascalName, schemaVarName, schemaContent, collectionName, timestamps) {
+  const schemaOptions = timestamps ? `{ timestamps: true }` : `{}`;
   return `const mongoose = require('mongoose');
 
 const ${schemaVarName} = new mongoose.Schema(
 ${schemaContent},
-  { timestamps: true }
+  ${schemaOptions}
 );
 
 module.exports = mongoose.model('${pascalName}', ${schemaVarName}, '${collectionName}');
 `;
 }
 
-/**
- * Template ESM: dùng import / export default
- */
-function renderESM(pascalName, schemaVarName, schemaContent, collectionName) {
+function renderESM(pascalName, schemaVarName, schemaContent, collectionName, timestamps) {
+  const schemaOptions = timestamps ? `{ timestamps: true }` : `{}`;
   return `import mongoose from 'mongoose';
 
 const ${schemaVarName} = new mongoose.Schema(
 ${schemaContent},
-  { timestamps: true }
+  ${schemaOptions}
 );
 
 export default mongoose.model('${pascalName}', ${schemaVarName}, '${collectionName}');
@@ -262,11 +258,12 @@ function countTodos(content) {
 }
 
 /**
- * @param {object|object[]} jsonData  - dữ liệu mẫu
+ * @param {object|object[]} jsonData
  * @param {string}          entityName
- * @param {'cjs'|'esm'}     mode      - output format
+ * @param {'cjs'|'esm'}     mode       - output format (default: 'cjs')
+ * @param {boolean}         timestamps - thêm { timestamps: true } vào schema (default: false)
  */
-function generateModelFile(jsonData, entityName, mode = 'cjs') {
+function generateModelFile(jsonData, entityName, mode = 'cjs', timestamps = false) {
   const samples = Array.isArray(jsonData) ? jsonData : [jsonData];
   const schemaDefinition = buildSchemaDefinition(samples);
   const schemaContent = stringifySchema(schemaDefinition);
@@ -278,8 +275,8 @@ function generateModelFile(jsonData, entityName, mode = 'cjs') {
 
   const content =
     mode === 'esm'
-      ? renderESM(pascalName, schemaVarName, schemaContent, collectionName)
-      : renderCJS(pascalName, schemaVarName, schemaContent, collectionName);
+      ? renderESM(pascalName, schemaVarName, schemaContent, collectionName, timestamps)
+      : renderCJS(pascalName, schemaVarName, schemaContent, collectionName, timestamps);
 
   const todoCount = countTodos(content);
   if (todoCount > 0) {
@@ -315,19 +312,19 @@ function writeModelFile(outputDir, entityName, content) {
   return filePath;
 }
 
-function processEntity(name, data, outputDir, mode) {
+function processEntity(name, data, outputDir, mode, timestamps) {
   const samples = Array.isArray(data) ? data : [data];
   if (samples.length === 0 || !samples[0]) {
     console.warn(`Bỏ qua "${name}": không có dữ liệu mẫu hợp lệ.`);
     return null;
   }
 
-  const { content, warnings } = generateModelFile(samples, name, mode);
+  const { content, warnings } = generateModelFile(samples, name, mode, timestamps);
   const filePath = writeModelFile(outputDir, name, content);
 
-  console.log(` Đã tạo: ${filePath}`);
+  console.log(`✅ Đã tạo: ${filePath}`);
   if (warnings.length > 0) {
-    warnings.forEach((w) => console.warn(`   ${w}`));
+    warnings.forEach((w) => console.warn(`   ⚠️  ${w}`));
   }
   return filePath;
 }
@@ -335,8 +332,9 @@ function processEntity(name, data, outputDir, mode) {
 /* --------------------------------- CLI --------------------------------- */
 
 function parseArgs(argv) {
-  const args = argv.slice(2); // bỏ 'node' và tên script
-  let mode = 'cjs'; // default
+  const args = argv.slice(2);
+  let mode = 'cjs';
+  let timestamps = false;
   let outputDir = null;
   const positional = [];
 
@@ -346,6 +344,8 @@ function parseArgs(argv) {
       mode = 'esm';
     } else if (arg === '--cjs') {
       mode = 'cjs';
+    } else if (arg === '--timestamps' || arg === '-t') {
+      timestamps = true;
     } else if (arg === '--output' || arg === '-o') {
       outputDir = args[++i];
     } else if (arg.startsWith('--output=')) {
@@ -359,17 +359,19 @@ function parseArgs(argv) {
     inputPath: positional[0] || null,
     outputDir: outputDir || positional[1] || './models',
     mode,
+    timestamps,
   };
 }
 
 function printUsage() {
   console.log(`Cách dùng:
-  node generate-mongoose-model.js <input.json | input-folder> [outputDir] [--esm | --cjs]
+  node generate-mongoose-model.js <input.json | input-folder> [outputDir] [flags]
 
 Flags:
-  --cjs          Output dùng require / module.exports  (mặc định)
-  --esm          Output dùng import / export default
-  --output, -o   Thư mục đầu ra (thay thế cho positional outputDir)
+  --cjs              Output dùng require / module.exports  (mặc định)
+  --esm              Output dùng import / export default
+  --timestamps, -t   Thêm { timestamps: true } vào schema  (mặc định: không có)
+  --output, -o       Thư mục đầu ra (thay thế cho positional outputDir)
 
 Định dạng input được hỗ trợ:
   1) File JSON chứa 1 document mẫu            -> tên entity lấy theo tên file
@@ -380,8 +382,9 @@ Flags:
 
 Ví dụ:
   node generate-mongoose-model.js data/user.json
-  node generate-mongoose-model.js data/user.json --esm
-  node generate-mongoose-model.js data/ ./src/models --esm
+  node generate-mongoose-model.js data/user.json --timestamps
+  node generate-mongoose-model.js data/user.json --esm --timestamps
+  node generate-mongoose-model.js data/ ./src/models --esm -t
   node generate-mongoose-model.js entities.json -o ./models --cjs
 
 Tính năng tự động:
@@ -389,24 +392,23 @@ Tính năng tự động:
   - Phát hiện self-reference (manager, supervisor, parent, reportTo...)
   - Gợi ý unique: true nếu tất cả giá trị đều khác nhau (>= 3 mẫu)
   - Gợi ý enum khi field String có ít giá trị unique (kèm cảnh báo thiếu value)
-  - Thêm { timestamps: true } tự động
   - Cảnh báo số lượng TODO cần review thủ công
 `);
 }
 
 function main() {
-  const { inputPath, outputDir, mode } = parseArgs(process.argv);
+  const { inputPath, outputDir, mode, timestamps } = parseArgs(process.argv);
 
   if (!inputPath) {
     printUsage();
     process.exit(1);
   }
   if (!fs.existsSync(inputPath)) {
-    console.error(` Không tìm thấy: "${inputPath}"`);
+    console.error(`❌ Không tìm thấy: "${inputPath}"`);
     process.exit(1);
   }
 
-  console.log(` Mode: ${mode.toUpperCase()}\n`);
+  console.log(`📦 Mode: ${mode.toUpperCase()} | Timestamps: ${timestamps ? 'bật' : 'tắt'}\n`);
 
   const stat = fs.statSync(inputPath);
   const generated = [];
@@ -421,26 +423,26 @@ function main() {
     for (const file of files) {
       const entityName = deriveEntityName(file);
       const json = readJSON(path.join(inputPath, file));
-      const result = processEntity(entityName, json, outputDir, mode);
+      const result = processEntity(entityName, json, outputDir, mode, timestamps);
       if (result) generated.push(result);
     }
   } else {
     const json = readJSON(inputPath);
     if (isEntityConfigArray(json)) {
       for (const { name, data } of json) {
-        const result = processEntity(name, data, outputDir, mode);
+        const result = processEntity(name, data, outputDir, mode, timestamps);
         if (result) generated.push(result);
       }
     } else {
       const entityName = deriveEntityName(inputPath);
-      const result = processEntity(entityName, json, outputDir, mode);
+      const result = processEntity(entityName, json, outputDir, mode, timestamps);
       if (result) generated.push(result);
     }
   }
 
   console.log(`\nHoàn tất! Đã sinh ${generated.length} model file (${mode.toUpperCase()}) vào "${outputDir}".`);
   if (totalWarnings > 0) {
-    console.warn(`  Hãy tìm kiếm "TODO" trong các file vừa tạo để hoàn thiện schema.`);
+    console.warn(`⚠️  Hãy tìm kiếm "TODO" trong các file vừa tạo để hoàn thiện schema.`);
   }
 }
 
