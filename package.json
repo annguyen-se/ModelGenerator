@@ -1,0 +1,9 @@
+{
+  "name": "modelgen",
+  "version": "1.0.0",
+  "description": "Generate Mongoose models from sample JSON (shares cast logic with import-data.js)",
+  "main": "generate-mongoose-model.js",
+  "dependencies": {
+    "mongoose": "^9.7.4"
+  }
+}

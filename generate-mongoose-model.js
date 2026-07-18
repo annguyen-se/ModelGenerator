@@ -4,6 +4,8 @@
 
 const fs = require('fs');
 const path = require('path');
+const mongoose = require('mongoose');
+const { castMongo } = require('./mongo-cast');
 
 /* ----------------------------- Helpers chung ----------------------------- */
 function isISODateString(value) {
@@ -135,6 +137,13 @@ function inferType(value, key = '', context = {}) {
   }
 
   if (typeof value === 'object' && !Array.isArray(value)) {
+    // Sau khi cast Mongo: {$oid:...} -> ObjectId instance; {$date:...} -> Date instance.
+    // Cần check trước nhánh raw '$oid'/'"$date" vì cả hai đều là typeof 'object'.
+    if (value instanceof mongoose.Types.ObjectId || value._bsontype === 'ObjectID') {
+      const { def, todo } = resolveRef(key, value.toString(), context);
+      return `${def}${todo}`;
+    }
+    if (value instanceof Date) return 'Date';
     if ('$oid' in value) {
       const { def, todo } = resolveRef(key, value.$oid, context);
       return `${def}${todo}`;
@@ -147,7 +156,6 @@ function inferType(value, key = '', context = {}) {
 
   switch (type) {
     case 'string':
-      if (isISODateString(value)) return 'Date';
       if (looksLikeObjectId(value)) {
         const { def, todo } = resolveRef(key, value, context);
         return `${def}${todo}`;
@@ -155,6 +163,8 @@ function inferType(value, key = '', context = {}) {
       if (SELF_REF_KEYS.has(key) || SELF_REF_KEYS.has(key.replace(/(_id|Id)$/, ''))) {
         return `{ type: mongoose.Schema.Types.ObjectId, ref: '__SELF__' } /* TODO: thay __SELF__ bằng tên Model hiện tại (self-reference; data mẫu đang lưu string) */`;
       }
+      // Sau khi cast Mongo thật: wrapper {$date:...} đã thành Date instance; string ISO còn nguyên.
+      // Không đoán Date từ string ISO nữa — khớp chính xác với document import. User tự đổi nếu cần.
       return 'String';
 
     case 'number':
@@ -172,6 +182,12 @@ function inferType(value, key = '', context = {}) {
           return `[mongoose.Schema.Types.Mixed] /* TODO: mảng rỗng trong mẫu - xác nhận kiểu phần tử */`;
         }
         const first = value[0];
+        // Element đã cast: là ObjectId instance -> ref
+        if (first instanceof mongoose.Types.ObjectId || (first && first._bsontype === 'ObjectID')) {
+          const { def, todo } = resolveRef(key, first.toString(), context);
+          return `[${def}]${todo}`;
+        }
+        // Element thô có $oid
         if (typeof first === 'object' && first !== null && '$oid' in first) {
           const { def, todo } = resolveRef(key, first.$oid, context);
           return `[${def}]${todo}`;
@@ -183,6 +199,7 @@ function inferType(value, key = '', context = {}) {
         return `[${innerType}]`;
       }
 
+      // ObjectId/Date instance đã được xử lý ở block trên; còn lại là nested schema thường
       const nestedSchema = {};
       for (const k in value) {
         if (k === '_id') continue;
@@ -233,13 +250,17 @@ function detectEnum(samples, key) {
 }
 
 function detectUnique(samples, key) {
+  // Tự gắn `unique: true` chỉ khi TÊN field gợi ý khóa duy nhất (email/username/code/sku/...)
+  // và có đủ mẫu dữ liệu để tin cậy. Với field khác -> trả về 'maybe' để gắn TODO.
+  const UNIQUE_NAME_HINT = /\b(email|username|userName|emailAddress|^code$|^sku$|^slug$|phoneNumber|accountNumber)\b/i;
   if (samples.length < 3) return false;
   const values = samples
     .map((s) => s[key])
     .filter((v) => v !== null && v !== undefined && (typeof v === 'string' || typeof v === 'number'));
   if (values.length < samples.length) return false;
-  const unique = new Set(values);
-  return unique.size === values.length;
+  const isUnique = new Set(values).size === values.length;
+  if (isUnique) return UNIQUE_NAME_HINT.test(key) ? true : 'maybe';
+  return false;
 }
 
 function buildSchemaDefinition(samples, context = {}) {
@@ -260,8 +281,10 @@ function buildSchemaDefinition(samples, context = {}) {
         const enumStr = enumValues.map((v) => `'${v}'`).join(', ');
         const enumNote = 'TODO: enum chỉ từ data mẫu - kiểm tra có thiếu value nào không';
         typeDef = `{ type: String, enum: [${enumStr}] } /* ${enumNote} */`;
-      } else if (isUnique) {
+      } else if (isUnique === true) {
         typeDef = `{ type: String, unique: true }`;
+      } else if (isUnique === 'maybe') {
+        typeDef = `String /* TODO: unique? các giá trị mẫu đều khác nhau nhưng tên field không gợi ý khóa duy nhất */`;
       }
     }
 
@@ -312,7 +335,9 @@ function countTodos(content) {
  * @param {object}          context    - { oidToModel: Map } để resolve ref chính xác
  */
 function generateModelFile(jsonData, entityName, mode = 'cjs', timestamps = false, context = {}) {
-  const samples = Array.isArray(jsonData) ? jsonData : [jsonData];
+  const rawSamples = Array.isArray(jsonData) ? jsonData : [jsonData];
+  // Cast giống Mongo import -> suy luận kiểu trên giá trị SAU CAST khớp với document thật.
+  const samples = rawSamples.map(castMongo);
   const schemaDefinition = buildSchemaDefinition(samples, context);
   const schemaContent = stringifySchema(schemaDefinition);
 
