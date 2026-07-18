@@ -66,27 +66,78 @@ function looksLikeObjectId(value) {
   return typeof value === 'string' && /^[a-f\d]{24}$/i.test(value);
 }
 
+// Nguồn ref chỉ đoán được từ TÊN field, không biết $oid trỏ tới collection nào.
+// -> self-ref ưu tiên trước; ref đoán từ tên luôn kèm TODO để bắt buộc review.
+// ponytail: heuristic theo tên field, chỉ dùng khi KHÔNG resolve được oid -> model thật
+function refObject(key) {
+  // self-ref có thể ở dạng 'supervisor' hoặc 'supervisorId' -> đối chiếu cả bản đã bỏ hậu tố Id
+  const base = key.replace(/(_id|Id)$/, '');
+  if (SELF_REF_KEYS.has(key) || SELF_REF_KEYS.has(base)) {
+    return {
+      def: `{ type: mongoose.Schema.Types.ObjectId, ref: '__SELF__' }`,
+      todo: ` /* TODO: thay __SELF__ bằng tên Model hiện tại (self-reference) */`,
+    };
+  }
+  if (looksLikeForeignKey(key)) {
+    return {
+      def: `{ type: mongoose.Schema.Types.ObjectId, ref: '${extractRefFromKey(key)}' }`,
+      todo: ` /* TODO: xác nhận ref (đoán từ tên field, có thể viết tắt) */`,
+    };
+  }
+  return {
+    def: `{ type: mongoose.Schema.Types.ObjectId, ref: '__TODO__' }`,
+    todo: ` /* TODO: điền tên Model */`,
+  };
+}
+
+/* --------- Resolve ref chính xác bằng cách tra oid -> Model thật --------- */
+
+function extractOid(idVal) {
+  if (idVal == null) return null;
+  if (typeof idVal === 'string') return /^[a-f\d]{24}$/i.test(idVal) ? idVal.toLowerCase() : null;
+  if (typeof idVal === 'object' && idVal.$oid) return String(idVal.$oid).toLowerCase();
+  return null;
+}
+
+// entities: [{ name, data }]  ->  Map(oid -> ModelPascalName)
+function buildOidIndex(entities) {
+  const map = new Map();
+  for (const { name, data } of entities) {
+    const model = toPascalCase(name);
+    const samples = Array.isArray(data) ? data : [data];
+    for (const doc of samples) {
+      const oid = doc && extractOid(doc._id);
+      if (oid) map.set(oid, model);
+    }
+  }
+  return map;
+}
+
+// Có oid + index -> ref = Model thật (không TODO). Không -> fallback heuristic tên field.
+function resolveRef(key, oidStr, context) {
+  const idx = context && context.oidToModel;
+  const model = idx && oidStr && idx.get(String(oidStr).toLowerCase());
+  if (model) {
+    return { def: `{ type: mongoose.Schema.Types.ObjectId, ref: '${model}' }`, todo: '' };
+  }
+  return refObject(key);
+}
+
 /* ------------------------------ Suy luận kiểu ------------------------------ */
 
 function inferType(value, key = '', context = {}) {
   if (value === null || value === undefined) {
-    if (SELF_REF_KEYS.has(key)) {
-      return `{ type: mongoose.Schema.Types.ObjectId, ref: '__SELF__' } /* TODO: thay __SELF__ bằng tên Model hiện tại */`;
-    }
-    if (looksLikeForeignKey(key)) {
-      const ref = extractRefFromKey(key);
-      return `{ type: mongoose.Schema.Types.ObjectId, ref: '${ref}' } /* TODO: xác nhận ref */`;
+    if (SELF_REF_KEYS.has(key) || looksLikeForeignKey(key)) {
+      const { def, todo } = refObject(key); // null -> không có oid để tra, dùng heuristic
+      return `${def}${todo}`;
     }
     return 'mongoose.Schema.Types.Mixed /* TODO: null trong mẫu - xác nhận kiểu thực */';
   }
 
   if (typeof value === 'object' && !Array.isArray(value)) {
     if ('$oid' in value) {
-      if (looksLikeForeignKey(key)) {
-        const ref = extractRefFromKey(key);
-        return `{ type: mongoose.Schema.Types.ObjectId, ref: '${ref}' }`;
-      }
-      return `{ type: mongoose.Schema.Types.ObjectId, ref: '__TODO__' } /* TODO: điền tên Model */`;
+      const { def, todo } = resolveRef(key, value.$oid, context);
+      return `${def}${todo}`;
     }
     if ('$date' in value) return 'Date';
     if ('$numberDecimal' in value) return 'Number /* Decimal128 - cân nhắc dùng mongoose.Schema.Types.Decimal128 */';
@@ -98,14 +149,11 @@ function inferType(value, key = '', context = {}) {
     case 'string':
       if (isISODateString(value)) return 'Date';
       if (looksLikeObjectId(value)) {
-        if (looksLikeForeignKey(key)) {
-          const ref = extractRefFromKey(key);
-          return `{ type: mongoose.Schema.Types.ObjectId, ref: '${ref}' } /* TODO: xác nhận ref */`;
-        }
-        return `{ type: mongoose.Schema.Types.ObjectId, ref: '__TODO__' } /* TODO: có thể là ObjectId - xác nhận */`;
+        const { def, todo } = resolveRef(key, value, context);
+        return `${def}${todo}`;
       }
-      if (SELF_REF_KEYS.has(key)) {
-        return `{ type: mongoose.Schema.Types.ObjectId, ref: '__SELF__' } /* TODO: thay __SELF__ bằng tên Model hiện tại - data mẫu đang lưu string tên thay vì ObjectId */`;
+      if (SELF_REF_KEYS.has(key) || SELF_REF_KEYS.has(key.replace(/(_id|Id)$/, ''))) {
+        return `{ type: mongoose.Schema.Types.ObjectId, ref: '__SELF__' } /* TODO: thay __SELF__ bằng tên Model hiện tại (self-reference; data mẫu đang lưu string) */`;
       }
       return 'String';
 
@@ -125,9 +173,8 @@ function inferType(value, key = '', context = {}) {
         }
         const first = value[0];
         if (typeof first === 'object' && first !== null && '$oid' in first) {
-          const ref = looksLikeForeignKey(key) ? extractRefFromKey(key) : '__TODO__';
-          const todo = ref === '__TODO__' ? ' /* TODO: điền tên Model */' : '';
-          return `[{ type: mongoose.Schema.Types.ObjectId, ref: '${ref}' }]${todo}`;
+          const { def, todo } = resolveRef(key, first.$oid, context);
+          return `[${def}]${todo}`;
         }
         const innerType = inferType(first, key, context);
         if (typeof innerType === 'object') {
@@ -195,7 +242,7 @@ function detectUnique(samples, key) {
   return unique.size === values.length;
 }
 
-function buildSchemaDefinition(samples) {
+function buildSchemaDefinition(samples, context = {}) {
   const keys = new Set();
   samples.forEach((s) => Object.keys(s || {}).forEach((k) => keys.add(k)));
 
@@ -204,7 +251,7 @@ function buildSchemaDefinition(samples) {
     if (key === '__v' || key === '_id') continue;
 
     const representative = pickRepresentativeValue(samples, key);
-    let typeDef = inferType(representative, key);
+    let typeDef = inferType(representative, key, context);
     const isUnique = detectUnique(samples, key);
 
     if (typeDef === 'String') {
@@ -262,10 +309,11 @@ function countTodos(content) {
  * @param {string}          entityName
  * @param {'cjs'|'esm'}     mode       - output format (default: 'cjs')
  * @param {boolean}         timestamps - thêm { timestamps: true } vào schema (default: false)
+ * @param {object}          context    - { oidToModel: Map } để resolve ref chính xác
  */
-function generateModelFile(jsonData, entityName, mode = 'cjs', timestamps = false) {
+function generateModelFile(jsonData, entityName, mode = 'cjs', timestamps = false, context = {}) {
   const samples = Array.isArray(jsonData) ? jsonData : [jsonData];
-  const schemaDefinition = buildSchemaDefinition(samples);
+  const schemaDefinition = buildSchemaDefinition(samples, context);
   const schemaContent = stringifySchema(schemaDefinition);
 
   const pascalName = toPascalCase(entityName);
@@ -306,20 +354,20 @@ function isEntityConfigArray(json) {
 
 function writeModelFile(outputDir, entityName, content) {
   if (!fs.existsSync(outputDir)) fs.mkdirSync(outputDir, { recursive: true });
-  const fileName = `${entityName.toLowerCase()}.model.js`;
+  const fileName = `${entityName.toLowerCase()}.js`;
   const filePath = path.join(outputDir, fileName);
   fs.writeFileSync(filePath, content, 'utf-8');
   return filePath;
 }
 
-function processEntity(name, data, outputDir, mode, timestamps) {
+function processEntity(name, data, outputDir, mode, timestamps, context = {}) {
   const samples = Array.isArray(data) ? data : [data];
   if (samples.length === 0 || !samples[0]) {
     console.warn(`Bỏ qua "${name}": không có dữ liệu mẫu hợp lệ.`);
     return null;
   }
 
-  const { content, warnings } = generateModelFile(samples, name, mode, timestamps);
+  const { content, warnings } = generateModelFile(samples, name, mode, timestamps, context);
   const filePath = writeModelFile(outputDir, name, content);
 
   console.log(`✅ Đã tạo: ${filePath}`);
@@ -414,6 +462,8 @@ function main() {
   const generated = [];
   let totalWarnings = 0;
 
+  // Gom toàn bộ entity trước -> build index oid->Model -> resolve ref chính xác
+  const entities = [];
   if (stat.isDirectory()) {
     const files = fs.readdirSync(inputPath).filter((f) => f.endsWith('.json'));
     if (files.length === 0) {
@@ -421,23 +471,21 @@ function main() {
       process.exit(1);
     }
     for (const file of files) {
-      const entityName = deriveEntityName(file);
-      const json = readJSON(path.join(inputPath, file));
-      const result = processEntity(entityName, json, outputDir, mode, timestamps);
-      if (result) generated.push(result);
+      entities.push({ name: deriveEntityName(file), data: readJSON(path.join(inputPath, file)) });
     }
   } else {
     const json = readJSON(inputPath);
     if (isEntityConfigArray(json)) {
-      for (const { name, data } of json) {
-        const result = processEntity(name, data, outputDir, mode, timestamps);
-        if (result) generated.push(result);
-      }
+      for (const { name, data } of json) entities.push({ name, data });
     } else {
-      const entityName = deriveEntityName(inputPath);
-      const result = processEntity(entityName, json, outputDir, mode, timestamps);
-      if (result) generated.push(result);
+      entities.push({ name: deriveEntityName(inputPath), data: json });
     }
+  }
+
+  const context = { oidToModel: buildOidIndex(entities) };
+  for (const { name, data } of entities) {
+    const result = processEntity(name, data, outputDir, mode, timestamps, context);
+    if (result) generated.push(result);
   }
 
   console.log(`\nHoàn tất! Đã sinh ${generated.length} model file (${mode.toUpperCase()}) vào "${outputDir}".`);
@@ -462,4 +510,7 @@ module.exports = {
   detectUnique,
   looksLikeForeignKey,
   extractRefFromKey,
+  buildOidIndex,
+  resolveRef,
+  extractOid,
 };
