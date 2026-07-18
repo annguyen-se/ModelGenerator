@@ -10,7 +10,7 @@ Yêu cầu: [Node.js](https://nodejs.org/) đã được cài đặt.
 npm install
 ```
 
-(Chỉ cần `mongoose` — dùng chung với `import-data.js` qua module `mongo-cast.js`.)
+(Chỉ cần `mongoose` — dùng để tạo `ObjectId`/`Date` instance trong `mongo-cast.js`.)
 
 ## Cách dùng (CLI)
 
@@ -50,7 +50,8 @@ node generate-mongoose-model.js .\inputs\ .\models\ --esm --timestamps
 
 **Fallback theo tên field**: nếu không tra được `$oid` (vd chạy 1 file lẻ), tool đoán ref từ tên field (`userId -> User`) và kèm comment `TODO` để nhắc review.
 
-**Nhận diện kiểu theo import thật**: tool cast mỗi document bằng cùng logic với `import-data.js` (xem `mongo-cast.js`) trước khi suy luận kiểu. Kết quả:
+**Nhận diện kiểu theo document đã cast**: tool chuyển mỗi document qua `mongo-cast.js` (chuyển `{$oid:...}` → `ObjectId` instance, `{$date:...}` → `Date` instance, `{$numberDecimal:...}` → `Number`) trước khi suy luận kiểu. Kết quả khớp với document thật khi insert bằng `import-data.js`:
+
 - `{$oid: ...}` → `ObjectId`, ref tới model đúng.
 - `{$date: ...}` → `Date`.
 - `{$numberDecimal: ...}` → `Number` (kèm comment gợi ý `Decimal128`).
@@ -58,5 +59,4 @@ node generate-mongoose-model.js .\inputs\ .\models\ --esm --timestamps
 
 **Gợi ý schema**: hợp nhất nhiều mẫu để ra schema đầy đủ nhất; gợi ý `enum` từ tập giá trị nhỏ; **chỉ tự gắn `unique: true` khi tên field có khóa duy nhất (`email`, `username`, `code`, `sku`, `slug`, `phoneNumber`, `accountNumber`)**. Với field khác mà data trùng khớp toàn bộ, tool chỉ gắn `/* TODO: unique? */` để tránh ràng buộc sai gây `E11000` khi insert.
 
-**Chuẩn hóa**: tên entity → PascalCase cho `model name`; tên collection → chữ thường (khớp `import-data.js`).
-
+**Chuẩn hóa**: tên entity → PascalCase cho `model name`; tên collection → chữ thường (theo quy ước Mongo).
